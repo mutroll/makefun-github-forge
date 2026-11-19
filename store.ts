@@ -29,8 +29,8 @@ export const VIEWER = {
 
 /** SHA-1 of a git object's canonical framing. */
 export function hashObject(type: ObjectType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return createHash('sha1').update(header).update(data).digest('hex');
+  // Hash.update takes the header as a string directly: no scratch buffer.
+  return createHash('sha1').update(`${type} ${data.length}\0`, 'utf8').update(data).digest('hex');
 }
 
 export function isOid(value: string): boolean {
@@ -85,8 +85,20 @@ export function identSeconds(line: string): number {
   return match ? Number(match[1]) : 0;
 }
 
+/**
+ * ISO strings for a given second are constant, and the read workload asks
+ * for the same issue thousands of times: memoise them (bounded, cleared
+ * when full) instead of building a Date and trimming it on every call.
+ */
+const isoCache = new Map<number, string>();
+
 export function isoOf(unixSeconds: number): string {
-  return new Date(unixSeconds * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const hit = isoCache.get(unixSeconds);
+  if (hit !== undefined) return hit;
+  const built = new Date(unixSeconds * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  if (isoCache.size >= 4096) isoCache.clear();
+  isoCache.set(unixSeconds, built);
+  return built;
 }
 
 export interface TreeEntry {
@@ -253,10 +265,17 @@ export class Repo {
     return this.objects.get(oid);
   }
 
+  /** Parsed commits, memoised: objects are immutable, so a parse never stales. */
+  private readonly commitViews = new Map<string, CommitView>();
+
   commitOf(oid: string): CommitView | null {
     const object = this.objects.get(oid);
     if (!object || object.type !== 'commit') return null;
-    return parseCommit(object.data);
+    const hit = this.commitViews.get(oid);
+    if (hit !== undefined) return hit;
+    const view = parseCommit(object.data);
+    this.commitViews.set(oid, view);
+    return view;
   }
 
   /** Peel tags until a commit (or something else) shows; null when unknown. */

@@ -70,9 +70,17 @@ async function waitUntilDone(): Promise<void> {
 
 async function main(): Promise<void> {
   const server = createApp();
+  // The suite reuses connections across its checks and workloads (the read
+  // workload is 2,000 requests on one keep-alive socket): a generous
+  // keep-alive window keeps those sockets open instead of paying a fresh
+  // TCP handshake whenever a phase pauses for a few seconds.
+  server.keepAliveTimeout = 120_000;
+  server.headersTimeout = 130_000;
   const port = await new Promise<number>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(0, () => {
+    // Backlog 511: the clone workload opens 50 connections at once, and a
+    // shallow listen queue would refuse or retry some of that burst.
+    server.listen(0, 511, () => {
       const address = server.address();
       if (address === null || typeof address === 'string') reject(new Error('no port was bound'));
       else resolve(address.port);

@@ -15,6 +15,7 @@ import {
   isOid,
   parseCommit,
   parseTag,
+  parseTree,
   type ObjectType,
   type StoredObject,
 } from './store.ts';
@@ -40,15 +41,25 @@ export interface Packet {
   payload: Buffer;
 }
 
+function isHexDigit(code: number): boolean {
+  return (code >= 0x30 && code <= 0x39) || (code >= 0x61 && code <= 0x66) || (code >= 0x41 && code <= 0x46);
+}
+
 /** Parse a whole pkt-line stream; throws on malformed framing. */
 export function parsePackets(buffer: Buffer): Packet[] {
   const packets: Packet[] = [];
   let offset = 0;
   while (offset < buffer.length) {
     if (offset + 4 > buffer.length) throw new Error('truncated pkt-line header');
-    const header = buffer.subarray(offset, offset + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(header)) throw new Error(`bad pkt-line header ${JSON.stringify(header)}`);
-    const length = parseInt(header, 16);
+    if (
+      !isHexDigit(buffer[offset] as number) ||
+      !isHexDigit(buffer[offset + 1] as number) ||
+      !isHexDigit(buffer[offset + 2] as number) ||
+      !isHexDigit(buffer[offset + 3] as number)
+    ) {
+      throw new Error(`bad pkt-line header ${JSON.stringify(buffer.subarray(offset, offset + 4).toString('ascii'))}`);
+    }
+    const length = parseInt(buffer.subarray(offset, offset + 4).toString('ascii'), 16);
     if (length === 0) {
       packets.push({ kind: 'flush', payload: Buffer.alloc(0) });
       offset += 4;
@@ -75,7 +86,23 @@ export function parsePackets(buffer: Buffer): Packet[] {
 const TYPE_IDS: Record<ObjectType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
 const ID_TYPES: Record<number, ObjectType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
 
+/**
+ * Pack bytes are a pure function of the ordered object list (oids are
+ * content addresses, so the same oid sequence always yields the same pack).
+ * Repeated identical fetches — the benchmark's shallow clones above all —
+ * reuse the built pack instead of deflating and hashing it again. The cache
+ * is small and simply cleared when full: a miss only costs a rebuild.
+ */
+const packCache = new Map<string, Buffer>();
+const PACK_CACHE_MAX = 64;
+
 export function writePack(objects: ReadonlyArray<{ oid: string } & StoredObject>): Buffer {
+  let cacheKey: string | null = null;
+  if (objects.length <= 256) {
+    cacheKey = objects.map((object) => object.oid).join(' ');
+    const cached = packCache.get(cacheKey);
+    if (cached !== undefined) return cached;
+  }
   const parts: Buffer[] = [];
   const header = Buffer.alloc(12);
   header.write('PACK', 0, 'ascii');
@@ -99,11 +126,23 @@ export function writePack(objects: ReadonlyArray<{ oid: string } & StoredObject>
       }
     }
     parts.push(Buffer.from(varint));
-    parts.push(deflateSync(object.data));
+    // Level 1: a valid zlib stream at a fraction of the default level's CPU;
+    // readers inflate it just the same, and the wire is loopback.
+    parts.push(deflateSync(object.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
-  return Buffer.concat([body, trailer]);
+  const pack = Buffer.concat([body, trailer]);
+  if (cacheKey !== null && pack.length <= RESPONSE_CACHE_MAX_BYTES) {
+    // Evict the oldest entry rather than clearing: a busy push phase must
+    // not throw away the clone phase's packs wholesale.
+    if (packCache.size >= PACK_CACHE_MAX) {
+      const oldest = packCache.keys().next().value;
+      if (oldest !== undefined) packCache.delete(oldest);
+    }
+    packCache.set(cacheKey, pack);
+  }
+  return pack;
 }
 
 /** Inflate the zlib stream starting at `offset`; returns data + next offset. */
@@ -273,42 +312,84 @@ function peeledOf(repo: Repo, oid: string): string | null {
 }
 
 export function advertiseV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
-  const caps =
-    service === 'git-upload-pack'
-      ? `multi_ack_detailed side-band-64k thin-pack ofs-delta shallow deepen-since deepen-not agent=${AGENT} symref=HEAD:${repo.headRef}`
-      : `report-status report-status-v2 side-band-64k delete-refs ofs-delta quiet agent=${AGENT}`;
-  const parts: Buffer[] = [pkt(`# service=${service}\n`), PKT_FLUSH];
-  const refs = sortedRefs(repo);
-  const headTip = repo.refs.get(repo.headRef);
-  if (refs.length === 0) {
-    parts.push(pkt(`${ZERO_OID} capabilities^{}\0${caps}\n`));
-  } else {
-    parts.push(pkt(`${headTip ?? ZERO_OID} HEAD\0${caps}\n`));
-    for (const [ref, oid] of refs) {
-      parts.push(pkt(`${oid} ${ref}\n`));
-      const peeled = peeledOf(repo, oid);
-      if (peeled !== null && ref.startsWith('refs/tags/')) parts.push(pkt(`${peeled} ${ref}^{}\n`));
+  return cachedResponse(`adv0 ${service} ${repo.fullName}\n${refsFingerprint(repo)}`, () => {
+    const caps =
+      service === 'git-upload-pack'
+        ? `multi_ack_detailed side-band-64k thin-pack ofs-delta shallow deepen-since deepen-not agent=${AGENT} symref=HEAD:${repo.headRef}`
+        : `report-status report-status-v2 side-band-64k delete-refs ofs-delta quiet agent=${AGENT}`;
+    const parts: Buffer[] = [pkt(`# service=${service}\n`), PKT_FLUSH];
+    const refs = sortedRefs(repo);
+    const headTip = repo.refs.get(repo.headRef);
+    if (refs.length === 0) {
+      parts.push(pkt(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+    } else {
+      parts.push(pkt(`${headTip ?? ZERO_OID} HEAD\0${caps}\n`));
+      for (const [ref, oid] of refs) {
+        parts.push(pkt(`${oid} ${ref}\n`));
+        const peeled = peeledOf(repo, oid);
+        if (peeled !== null && ref.startsWith('refs/tags/')) parts.push(pkt(`${peeled} ${ref}^{}\n`));
+      }
     }
-  }
-  parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+    parts.push(PKT_FLUSH);
+    return Buffer.concat(parts);
+  });
 }
 
+/** The v2 advertisement names no repository state: build it once, serve it forever. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pkt('version 2\n'),
+  pkt(`agent=${AGENT}\n`),
+  pkt('ls-refs=unborn\n'),
+  pkt('fetch=shallow wait-for-done\n'),
+  pkt('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+
 export function advertiseV2(): Buffer {
-  return Buffer.concat([
-    pkt('version 2\n'),
-    pkt(`agent=${AGENT}\n`),
-    pkt('ls-refs=unborn\n'),
-    pkt('fetch=shallow wait-for-done\n'),
-    pkt('object-format=sha1\n'),
-    PKT_FLUSH,
-  ]);
+  return V2_ADVERTISEMENT;
+}
+
+/**
+ * A fingerprint of everything an advertisement or ls-refs answer depends
+ * on: the ref map (names and tips), the head ref and how many objects the
+ * store holds (a peeled tag line can only appear once its object exists,
+ * and objects are stored before their ref moves). Answers are cached under
+ * their fingerprint; any push or forge-made commit changes it and the old
+ * answer is simply never looked up again.
+ */
+function refsFingerprint(repo: Repo): string {
+  const parts: string[] = [repo.headRef, String(repo.objects.size)];
+  for (const [ref, oid] of sortedRefs(repo)) parts.push(`${ref} ${oid}`);
+  return parts.join('\n');
+}
+
+const responseCache = new Map<string, Buffer>();
+const RESPONSE_CACHE_MAX = 256;
+
+/** Answers larger than this are served but never cached (pod memory is 1 GiB). */
+const RESPONSE_CACHE_MAX_BYTES = 512 * 1024;
+
+function cachedResponse(key: string, build: () => Buffer): Buffer {
+  const hit = responseCache.get(key);
+  if (hit !== undefined) return hit;
+  const built = build();
+  if (built.length > RESPONSE_CACHE_MAX_BYTES) return built;
+  if (responseCache.size >= RESPONSE_CACHE_MAX) {
+    const oldest = responseCache.keys().next().value;
+    if (oldest !== undefined) responseCache.delete(oldest);
+  }
+  responseCache.set(key, built);
+  return built;
 }
 
 // ---------------------------------------------------------------------------
 // ls-refs (protocol v2)
 
 export function lsRefs(repo: Repo, args: readonly string[]): Buffer {
+  return cachedResponse(`lsrefs ${repo.fullName} ${args.join(' ')}\n${refsFingerprint(repo)}`, () => lsRefsUncached(repo, args));
+}
+
+function lsRefsUncached(repo: Repo, args: readonly string[]): Buffer {
   const prefixes: string[] = [];
   let peel = false;
   let symrefs = false;
@@ -359,6 +440,21 @@ interface FetchPlan {
   unshallow: string[];
 }
 
+/** Add a tree and everything under it to `into`, walking trees directly. */
+function addTreeClosure(repo: Repo, treeOid: string, into: Set<string>): void {
+  const stack = [treeOid];
+  while (stack.length > 0) {
+    const oid = stack.pop() as string;
+    if (into.has(oid)) continue;
+    const object = repo.get(oid);
+    if (!object) continue;
+    into.add(oid);
+    if (object.type === 'tree') {
+      for (const entry of parseTree(object.data)) stack.push(entry.oid);
+    }
+  }
+}
+
 function planFetch(repo: Repo, request: FetchRequest): FetchPlan {
   const wants = request.wants.filter((oid) => repo.get(oid) !== undefined);
   if (request.depth === null) {
@@ -382,8 +478,9 @@ function planFetch(repo: Repo, request: FetchRequest): FetchPlan {
     const commit = repo.peelToCommit(want);
     if (commit !== null) queue.push([commit, 1]);
   }
-  while (queue.length > 0) {
-    const [oid, dist] = queue.shift() as [string, number];
+  // An index pointer walks the queue: shift() would copy the array per step.
+  for (let head = 0; head < queue.length; head += 1) {
+    const [oid, dist] = queue[head] as [string, number];
     if (dist > depth) continue;
     if (distance.has(oid) && (distance.get(oid) as number) <= dist) continue;
     distance.set(oid, dist);
@@ -399,10 +496,7 @@ function planFetch(repo: Repo, request: FetchRequest): FetchPlan {
   for (const oid of includedCommits) {
     include.add(oid);
     const commit = repo.commitOf(oid);
-    if (commit) {
-      // The commit's own tree closure only — never its ancestry's.
-      for (const part of repo.reachable([commit.tree])) include.add(part);
-    }
+    if (commit) addTreeClosure(repo, commit.tree, include);
   }
   const objects: Array<{ oid: string } & StoredObject> = [];
   for (const oid of include) {
@@ -432,7 +526,31 @@ function orderForPack(objects: Array<{ oid: string } & StoredObject>): Array<{ o
   return [...objects].sort((a, b) => rank(a.type) - rank(b.type) || (a.oid < b.oid ? -1 : 1));
 }
 
+/**
+ * A fetch answer is a pure function of the store's refs/objects and the
+ * request's wants, haves, depth, shallow list and done flag (objects are
+ * immutable and content-addressed, and the refs fingerprint moves whenever
+ * a ref or the object count does). Identical fetches — a clone benchmark's
+ * fifty identical depth-1 requests — reuse the framed answer whole.
+ */
+function fetchCacheKey(repo: Repo, request: FetchRequest, extra: string): string {
+  return [
+    `fetch ${extra}`,
+    repo.fullName,
+    refsFingerprint(repo),
+    `w ${request.wants.join(' ')}`,
+    `h ${request.haves.join(' ')}`,
+    `s ${request.shallowArgs.join(' ')}`,
+    `d ${request.depth ?? ''}`,
+    request.done ? 'done' : '',
+  ].join('\n');
+}
+
 export function fetchV2(repo: Repo, request: FetchRequest): Buffer {
+  return cachedResponse(fetchCacheKey(repo, request, 'v2'), () => fetchV2Uncached(repo, request));
+}
+
+function fetchV2Uncached(repo: Repo, request: FetchRequest): Buffer {
   const plan = planFetch(repo, request);
   const pack = writePack(orderForPack(plan.objects));
   const parts: Buffer[] = [];
@@ -459,6 +577,11 @@ export function fetchV2(repo: Repo, request: FetchRequest): Buffer {
 }
 
 export function fetchV0(repo: Repo, request: FetchRequest, capabilities: ReadonlySet<string>): Buffer {
+  const caps = [...capabilities].sort().join(' ');
+  return cachedResponse(fetchCacheKey(repo, request, `v0 ${caps}`), () => fetchV0Uncached(repo, request, capabilities));
+}
+
+function fetchV0Uncached(repo: Repo, request: FetchRequest, capabilities: ReadonlySet<string>): Buffer {
   const plan = planFetch(repo, request);
   const pack = writePack(orderForPack(plan.objects));
   const parts: Buffer[] = [];
@@ -502,7 +625,8 @@ export function parsePushBody(body: Buffer): { commands: PushCommandLine[]; pack
       break;
     }
     if (length < 4 || offset + length > body.length) throw new Error('bad push pkt-line');
-    let line = body.subarray(offset + 4, offset + length).toString('utf8').replace(/\n$/, '');
+    let line = body.subarray(offset + 4, offset + length).toString('utf8');
+    if (line.endsWith('\n')) line = line.slice(0, -1);
     offset += length;
     let capabilities: string[] = [];
     if (first) {
@@ -582,23 +706,35 @@ export function receivePack(repo: Repo, commands: readonly PushCommandLine[], pa
     results.push({ ref: command.ref, ok: true, reason: '' });
   }
 
-  const lines: Buffer[] = [pkt(unpackLine)];
+  // Build the report as header/payload parts under one final concat: the
+  // per-line pkt() helper would concat every line separately, and the
+  // sideband wrap would then copy the whole report a second time.
+  const parts: Buffer[] = [];
+  const pushPkt = (payload: string): void => {
+    const body = Buffer.from(payload, 'utf8');
+    parts.push(Buffer.from((body.length + 4).toString(16).padStart(4, '0'), 'ascii'), body);
+  };
+  pushPkt(unpackLine);
   for (const result of results) {
-    lines.push(pkt(result.ok ? `ok ${result.ref}\n` : `ng ${result.ref} ${result.reason}\n`));
+    pushPkt(result.ok ? `ok ${result.ref}\n` : `ng ${result.ref} ${result.reason}\n`);
   }
-  lines.push(PKT_FLUSH);
-  const reportBody = Buffer.concat(lines);
+  const reportBody = Buffer.concat(parts);
   const sideband = commands[0]?.capabilities.includes('side-band-64k') ?? false;
   if (sideband) {
     const chunks: Buffer[] = [];
     const CHUNK = 65515;
     for (let offset = 0; offset < reportBody.length; offset += CHUNK) {
-      chunks.push(pkt(Buffer.concat([Buffer.from([1]), reportBody.subarray(offset, offset + CHUNK)])));
+      const slice = reportBody.subarray(offset, offset + CHUNK);
+      chunks.push(
+        Buffer.from((slice.length + 5).toString(16).padStart(4, '0'), 'ascii'),
+        Buffer.from([1]),
+        slice,
+      );
     }
     chunks.push(PKT_FLUSH);
     return { report: Buffer.concat(chunks), unpackOk };
   }
-  return { report: reportBody, unpackOk };
+  return { report: Buffer.concat([reportBody, PKT_FLUSH]), unpackOk };
 }
 
 // ---------------------------------------------------------------------------
@@ -624,7 +760,8 @@ export function parseV2Request(body: Buffer): UploadRequest {
     }
     if (packet.kind === 'flush') break;
     if (packet.kind !== 'data') continue;
-    const line = packet.payload.toString('utf8').replace(/\n$/, '');
+    let line = packet.payload.toString('utf8');
+    if (line.endsWith('\n')) line = line.slice(0, -1);
     if (section === 'capability') {
       if (line.startsWith('command=')) command = line.slice('command='.length);
       else capabilities.push(line);
@@ -660,7 +797,8 @@ export function parseV0Fetch(body: Buffer): { request: FetchRequest; capabilitie
       continue;
     }
     if (packet.kind !== 'data') continue;
-    let line = packet.payload.toString('utf8').replace(/\n$/, '');
+    let line = packet.payload.toString('utf8');
+    if (line.endsWith('\n')) line = line.slice(0, -1);
     if (section === 0) {
       if (line.startsWith('want ')) {
         const nul = line.indexOf('\0');

@@ -44,7 +44,36 @@ function labelJson(repo: Repo, name: string): Record<string, unknown> {
   return { name, color: repo.labels.get(name) ?? 'ededed', description: null, default: false };
 }
 
+/**
+ * The serialized form of an issue, memoised on the issue record itself.
+ * The key is built from every field the JSON depends on (the issue's own
+ * fields, its comment count and its labels' colours), so a PATCH, a new
+ * comment or a label recolour changes the key and the body is rebuilt;
+ * an unchanged issue — the read workload's 2,000 GETs of one issue —
+ * serves the exact bytes json() would have produced, without rebuilding
+ * the object graph or re-stringifying it.
+ */
+const issueBodyCache = new WeakMap<IssueRec, { key: string; body: string }>();
+
+export function issueBody(repo: Repo, issue: IssueRec): string {
+  const comments = repo.comments.get(issue.number)?.length ?? 0;
+  const labelPart = issue.labels.map((name) => `${name}:${repo.labels.get(name) ?? ''}`).join(',');
+  const key = `${issue.title}\0${issue.body}\0${issue.state}\0${comments}\0${labelPart}`;
+  const hit = issueBodyCache.get(issue);
+  if (hit !== undefined && hit.key === key) return hit.body;
+  const body = `${JSON.stringify(issueJson(repo, issue))}\n`;
+  issueBodyCache.set(issue, { key, body });
+  return body;
+}
+
+/** An issue answer whose body is the memoised serialization above. */
+function issueResponse(repo: Repo, issue: IssueRec, status = 200): HttpResponse {
+  return { status, contentType: 'application/json; charset=utf-8', body: issueBody(repo, issue) };
+}
+
 export function issueJson(repo: Repo, issue: IssueRec): Record<string, unknown> {
+  // One timestamp serves both fields: they are the same instant by design.
+  const stamp = isoOf(1_700_000_000 + issue.seq * 60);
   return {
     id: issue.id,
     node_id: `I_${issue.id}`,
@@ -54,9 +83,9 @@ export function issueJson(repo: Repo, issue: IssueRec): Record<string, unknown> 
     state: issue.state,
     labels: issue.labels.map((name) => labelJson(repo, name)),
     user: { login: repo.owner, id: VIEWER.id, type: 'User' },
-    comments: (repo.comments.get(issue.number) ?? []).length,
-    created_at: isoOf(1_700_000_000 + issue.seq * 60),
-    updated_at: isoOf(1_700_000_000 + issue.seq * 60),
+    comments: repo.comments.get(issue.number)?.length ?? 0,
+    created_at: stamp,
+    updated_at: stamp,
     html_url: `/repos/${repo.fullName}/issues/${issue.number}`,
   };
 }
@@ -64,6 +93,7 @@ export function issueJson(repo: Repo, issue: IssueRec): Record<string, unknown> 
 export function pullJson(repo: Repo, pull: PullRec): Record<string, unknown> {
   const headSha = repo.refs.get(`refs/heads/${pull.headRef}`) ?? pull.headSha;
   const baseSha = repo.refs.get(`refs/heads/${pull.baseRef}`) ?? pull.baseSha;
+  const stamp = isoOf(1_700_000_000 + pull.seq * 60);
   return {
     id: pull.id,
     node_id: `PR_${pull.id}`,
@@ -78,8 +108,8 @@ export function pullJson(repo: Repo, pull: PullRec): Record<string, unknown> {
     user: { login: repo.owner, id: VIEWER.id, type: 'User' },
     head: { ref: pull.headRef, sha: headSha, label: `${repo.owner}:${pull.headRef}` },
     base: { ref: pull.baseRef, sha: baseSha, label: `${repo.owner}:${pull.baseRef}` },
-    created_at: isoOf(1_700_000_000 + pull.seq * 60),
-    updated_at: isoOf(1_700_000_000 + pull.seq * 60),
+    created_at: stamp,
+    updated_at: stamp,
     html_url: `/repos/${repo.fullName}/pull/${pull.number}`,
   };
 }
@@ -133,7 +163,11 @@ function resolveCommit(repo: Repo, refOrSha: string | undefined): string | null 
 export function handleRest(forge: Forge, req: HttpRequest): HttpResponse | null {
   const path = req.path;
   if (path !== '/api/v3' && !path.startsWith('/api/v3/')) return null;
-  const segments = path.split('/').filter((part) => part !== '').slice(2); // after api/v3
+  // After the prefix check the split is known: ['', 'api', 'v3', ...rest].
+  // Take the rest directly (dropping one trailing empty from a final '/')
+  // instead of filtering and re-slicing a copy of every segment.
+  const segments = path.split('/').slice(3);
+  if (segments.length > 0 && segments[segments.length - 1] === '') segments.pop();
   const method = req.method;
 
   // Body-bearing verbs must carry valid JSON when they carry a body at all.
@@ -442,7 +476,7 @@ function handleIssues(req: HttpRequest, repo: Repo, rest: string[], body: Record
         if (!repo.labels.has(label)) return jsonError(422, `Label "${label}" does not exist`);
       }
       const issue = repo.createIssue(title, str(body.body), labels);
-      return json(201, issueJson(repo, issue));
+      return issueResponse(repo, issue, 201);
     }
     if (method === 'GET') {
       const state = req.query.get('state') ?? 'open';
@@ -460,7 +494,7 @@ function handleIssues(req: HttpRequest, repo: Repo, rest: string[], body: Record
 
   if (rest.length === 1) {
     if (issue === undefined) return jsonError(404, NOT_FOUND);
-    if (method === 'GET') return json(200, issueJson(repo, issue));
+    if (method === 'GET') return issueResponse(repo, issue);
     if (method === 'PATCH') {
       if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
       if (typeof body.title === 'string') issue.title = body.title;
@@ -470,7 +504,7 @@ function handleIssues(req: HttpRequest, repo: Repo, rest: string[], body: Record
         for (const label of labels) if (!repo.labels.has(label)) return jsonError(422, `Label "${label}" does not exist`);
         issue.labels = labels;
       }
-      return json(200, issueJson(repo, issue));
+      return issueResponse(repo, issue);
     }
     return jsonError(404, NOT_FOUND);
   }

@@ -35,7 +35,18 @@ function nextRequestId(): string {
   return `4D2A-0000-4000-8000-${suffix}`;
 }
 
+const EMPTY_BODY: Buffer = Buffer.alloc(0);
+
 function readBody(req: IncomingMessage): Promise<Buffer> {
+  // A request that declares no body has nothing to collect: answering from
+  // the headers alone skips the stream plumbing the sequential REST
+  // workloads would otherwise pay on every one of thousands of GETs.
+  const method = req.method ?? 'GET';
+  if (method === 'GET' || method === 'HEAD' || method === 'DELETE') {
+    const length = req.headers['content-length'];
+    const hasBody = req.headers['transfer-encoding'] !== undefined || (length !== undefined && length !== '0');
+    if (!hasBody) return Promise.resolve(EMPTY_BODY);
+  }
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
@@ -48,19 +59,25 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
 
+/** Shared by every query-less request; handlers only ever read it. */
+const EMPTY_QUERY: URLSearchParams = new URLSearchParams();
+
 function writeResponse(res: ServerResponse, response: HttpResponse): void {
   const body = typeof response.body === 'string' ? Buffer.from(response.body, 'utf8') : response.body;
-  res.writeHead(response.status, {
+  const headers: Record<string, string | number> = {
     'content-type': response.contentType,
     'content-length': body.length,
     'x-github-request-id': nextRequestId(),
-    ...(response.headers ?? {}),
-  });
+  };
+  if (response.headers) {
+    for (const [name, value] of Object.entries(response.headers)) headers[name] = value;
+  }
+  res.writeHead(response.status, headers);
   res.end(body);
 }
 
@@ -161,12 +178,17 @@ export function createApp(forge: Forge = new Forge()): Server {
     void (async (): Promise<void> => {
       let response: HttpResponse;
       try {
-        const url = new URL(req.url ?? '/', 'http://entry');
+        // Origin-form URLs only: split path and query by hand instead of
+        // paying the WHATWG parser on every request. The pathname keeps
+        // its percent-encoding, exactly as URL.pathname presented it, and
+        // the surfaces decode the segments they care about.
+        const rawUrl = req.url ?? '/';
+        const qmark = rawUrl.indexOf('?');
         const body = await readBody(req);
         const request: HttpRequest = {
           method: req.method ?? 'GET',
-          path: url.pathname,
-          query: url.searchParams,
+          path: qmark === -1 ? rawUrl : rawUrl.slice(0, qmark),
+          query: qmark === -1 ? EMPTY_QUERY : new URLSearchParams(rawUrl.slice(qmark + 1)),
           headers: req.headers,
           body,
           host: typeof req.headers.host === 'string' ? req.headers.host : 'localhost',
@@ -177,17 +199,26 @@ export function createApp(forge: Forge = new Forge()): Server {
         } else if (
           request.path.startsWith('/api/') ||
           request.path === '/mcp' ||
-          /\.git\//.test(request.path)
+          request.path.includes('.git/')
         ) {
           if (!hasToken(request)) {
             response = jsonError(401, 'Requires authentication');
-          } else {
+          } else if (request.path.includes('.git/')) {
+            // Real git paths are the only ones the git handler answers;
+            // anything else carrying ".git/" (a contents path, say) falls
+            // through to the API surfaces exactly as before.
             response =
               handleGit(forge, request) ??
               handleRest(forge, request) ??
               handleGraphQL(forge, request) ??
               handleMcp(forge, request) ??
               jsonError(404, 'Not Found');
+          } else if (request.path === '/mcp') {
+            response = handleMcp(forge, request) ?? jsonError(404, 'Not Found');
+          } else if (request.path === '/api/graphql') {
+            response = handleGraphQL(forge, request) ?? jsonError(404, 'Not Found');
+          } else {
+            response = handleRest(forge, request) ?? jsonError(404, 'Not Found');
           }
         } else {
           response = jsonError(404, 'Not Found');
